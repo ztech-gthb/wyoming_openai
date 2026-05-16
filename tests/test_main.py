@@ -253,6 +253,97 @@ async def test_main_allows_unused_tts_response_format_in_stt_only_mode(monkeypat
 
 
 @pytest.mark.asyncio
+async def test_main_passes_cooldown_buffer_ms_from_env(monkeypatch):
+    captured_kwargs: dict = {}
+
+    async def fake_factory(*args, **kwargs):
+        return _FakeClient()
+
+    class _CapturingKwargsServer:
+        async def run(self, handler_factory):
+            captured_kwargs.update(handler_factory.keywords)
+
+    monkeypatch.setenv("TTS_COOLDOWN_BUFFER_MS", "300")
+    monkeypatch.setenv("TTS_TRAILING_SILENCE_MS", "150")
+    for env_var in ("STT_MODELS", "STT_STREAMING_MODELS"):
+        monkeypatch.delenv(env_var, raising=False)
+
+    monkeypatch.setattr(
+        main_module.CustomAsyncOpenAI,
+        "create_autodetected_factory",
+        staticmethod(lambda: fake_factory),
+    )
+    monkeypatch.setattr(
+        main_module.AsyncServer,
+        "from_uri",
+        staticmethod(lambda uri: _CapturingKwargsServer()),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "wyoming_openai",
+            "--tts-models",
+            "tts-1",
+            "--tts-voices",
+            "alloy",
+        ],
+    )
+
+    await main()
+
+    assert captured_kwargs["tts_cooldown_buffer_ms"] == 300
+    assert captured_kwargs["tts_trailing_silence_ms"] == 150
+
+
+@pytest.mark.asyncio
+async def test_main_cooldown_buffer_ms_defaults_to_none(monkeypatch):
+    captured_kwargs: dict = {}
+
+    async def fake_factory(*args, **kwargs):
+        return _FakeClient()
+
+    class _CapturingKwargsServer:
+        async def run(self, handler_factory):
+            captured_kwargs.update(handler_factory.keywords)
+
+    for env_var in (
+        "STT_MODELS",
+        "STT_STREAMING_MODELS",
+        "TTS_COOLDOWN_BUFFER_MS",
+        "TTS_TRAILING_SILENCE_MS",
+    ):
+        monkeypatch.delenv(env_var, raising=False)
+
+    monkeypatch.setattr(
+        main_module.CustomAsyncOpenAI,
+        "create_autodetected_factory",
+        staticmethod(lambda: fake_factory),
+    )
+    monkeypatch.setattr(
+        main_module.AsyncServer,
+        "from_uri",
+        staticmethod(lambda uri: _CapturingKwargsServer()),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "wyoming_openai",
+            "--tts-models",
+            "tts-1",
+            "--tts-voices",
+            "alloy",
+        ],
+    )
+
+    await main()
+
+    assert captured_kwargs["tts_cooldown_buffer_ms"] is None
+    assert captured_kwargs["tts_trailing_silence_ms"] is None
+
+
+@pytest.mark.asyncio
 async def test_main_allows_unused_stt_response_format_in_tts_only_mode(monkeypatch):
     async def fake_factory(*args, **kwargs):
         return _FakeClient()

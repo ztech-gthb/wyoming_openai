@@ -1,6 +1,7 @@
 import asyncio
 import io
 import logging
+import time
 import wave
 from dataclasses import dataclass
 from typing import cast
@@ -81,6 +82,8 @@ class OpenAIEventHandler(AsyncEventHandler):
         tts_extra_body: dict[str, object] | None = None,
         tts_streaming_min_words: int | None = None,
         tts_streaming_max_chars: int | None = None,
+        tts_cooldown_buffer_ms: int | None = None,
+        tts_trailing_silence_ms: int | None = None,
         **kwargs,
     ) -> None:
         """
@@ -99,6 +102,8 @@ class OpenAIEventHandler(AsyncEventHandler):
             tts_extra_body (dict[str, object] | None): Optional JSON body fields merged into TTS requests.
             tts_streaming_min_words (int | None): Minimum words per chunk for streaming TTS.
             tts_streaming_max_chars (int | None): Maximum characters per chunk for streaming TTS.
+            tts_cooldown_buffer_ms (int | None): Milliseconds to suppress STT after TTS ends.
+            tts_trailing_silence_ms (int | None): Milliseconds of PCM silence appended before AudioStop.
             Note: The caller owns the STT/TTS clients and is responsible for closing them.
             **kwargs: Arbitrary keyword arguments for the superclass.
         """
@@ -120,6 +125,9 @@ class OpenAIEventHandler(AsyncEventHandler):
             validate_tts_extra_body(self._tts_extra_body)
         self._tts_streaming_min_words = tts_streaming_min_words
         self._tts_streaming_max_chars = tts_streaming_max_chars
+        self._tts_cooldown_buffer_ms = tts_cooldown_buffer_ms
+        self._tts_trailing_silence_ms = tts_trailing_silence_ms
+        self._last_tts_end: float = 0.0
 
         # State for current transcription
         self._wav_buffer: NamedBytesIO | None = None
@@ -243,6 +251,28 @@ class OpenAIEventHandler(AsyncEventHandler):
             return
 
         self._is_recording = False
+
+        # Reject STT if TTS cooldown is active (prevents echo loop in continue_conversation)
+        if (
+            self._tts_cooldown_buffer_ms
+            and (time.monotonic() - self._last_tts_end) < self._tts_cooldown_buffer_ms / 1000.0
+        ):
+            elapsed_ms = (time.monotonic() - self._last_tts_end) * 1000
+            _LOGGER.info(
+                "STT suppressed: within TTS cooldown (%.0f ms elapsed, %.0f ms required)",
+                elapsed_ms,
+                self._tts_cooldown_buffer_ms,
+            )
+            if self._wav_write_buffer:
+                self._wav_write_buffer.close()
+                self._wav_write_buffer = None
+            if self._wav_buffer:
+                self._wav_buffer.close()
+                self._wav_buffer = None
+            await self.write_event(TranscriptStart().event())
+            await self.write_event(Transcript(text="").event())
+            await self.write_event(TranscriptStop().event())
+            return
 
         try:
             # Close the WAV file
@@ -615,6 +645,26 @@ class OpenAIEventHandler(AsyncEventHandler):
 
         return False
 
+    async def _finalize_tts(self, timestamp: float) -> float:
+        """Send optional trailing silence then AudioStop; record TTS-end time for STT cooldown."""
+        if self._tts_trailing_silence_ms:
+            silence_samples = int(self._tts_trailing_silence_ms * TTS_AUDIO_RATE / 1000)
+            silence_bytes = bytes(silence_samples * DEFAULT_AUDIO_WIDTH * DEFAULT_AUDIO_CHANNELS)
+            await self.write_event(
+                AudioChunk(
+                    audio=silence_bytes,
+                    rate=TTS_AUDIO_RATE,
+                    width=DEFAULT_AUDIO_WIDTH,
+                    channels=DEFAULT_AUDIO_CHANNELS,
+                    timestamp=int(timestamp),
+                ).event()
+            )
+            timestamp += self._tts_trailing_silence_ms
+        await self.write_event(AudioStop(timestamp=int(timestamp)).event())
+        if self._tts_cooldown_buffer_ms:
+            self._last_tts_end = time.monotonic()
+        return timestamp
+
     def _log_unsupported_asr_model(self, model_name: str | None = None):
         """Log an unsupported ASR model"""
         if model_name:
@@ -763,7 +813,7 @@ class OpenAIEventHandler(AsyncEventHandler):
 
             if final_timestamp is not None:
                 # Send audio stop after streaming completes
-                await self.write_event(AudioStop(timestamp=int(final_timestamp)).event())
+                await self._finalize_tts(final_timestamp)
                 _LOGGER.info("Successfully synthesized: %s", _truncate_for_log(synthesize.text))
                 return True
             return False
@@ -884,7 +934,7 @@ class OpenAIEventHandler(AsyncEventHandler):
 
         # Send audio stop if we processed any audio incrementally
         if self._audio_started:
-            await self.write_event(AudioStop(timestamp=int(self._current_timestamp)).event())
+            await self._finalize_tts(self._current_timestamp)
             await self.write_event(SynthesizeStopped().event())
             _LOGGER.info(
                 "Successfully completed incremental streaming synthesis, final timestamp: %.2f", self._current_timestamp
@@ -996,7 +1046,7 @@ class OpenAIEventHandler(AsyncEventHandler):
                     total_timestamp = chunk_timestamp
 
                 # Send final audio stop
-                await self.write_event(AudioStop(timestamp=int(total_timestamp)).event())
+                await self._finalize_tts(total_timestamp)
                 _LOGGER.info("Successfully completed concurrent streaming synthesis: %s", _truncate_for_log(full_text))
             else:
                 # Use non-streaming synthesis for non-streaming voices
@@ -1152,7 +1202,7 @@ class OpenAIEventHandler(AsyncEventHandler):
 
         if final_timestamp is not None:
             # Send audio stop after streaming completes
-            await self.write_event(AudioStop(timestamp=int(final_timestamp)).event())
+            await self._finalize_tts(final_timestamp)
             _LOGGER.info("Successfully synthesized non-streaming: %s", _truncate_for_log(text))
             return True
         return False

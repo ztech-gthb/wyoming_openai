@@ -206,6 +206,18 @@ async def main():
         default=int(_v) if (_v := os.getenv("TTS_STREAMING_MAX_CHARS")) else None,
         help="Maximum characters per chunk for streaming TTS (optional)",
     )
+    parser.add_argument(
+        "--tts-cooldown-buffer-ms",
+        type=int,
+        default=int(_v) if (_v := os.getenv("TTS_COOLDOWN_BUFFER_MS")) else None,
+        help="Milliseconds to suppress STT after TTS ends (prevents echo loop, default disabled)",
+    )
+    parser.add_argument(
+        "--tts-trailing-silence-ms",
+        type=int,
+        default=int(_v) if (_v := os.getenv("TTS_TRAILING_SILENCE_MS")) else None,
+        help="Milliseconds of PCM silence appended before AudioStop to delay mic-open (default disabled)",
+    )
 
     args = parser.parse_args()
 
@@ -356,6 +368,8 @@ async def main():
                 tts_extra_body=args.tts_extra_body,
                 tts_streaming_min_words=args.tts_streaming_min_words,
                 tts_streaming_max_chars=args.tts_streaming_max_chars,
+                tts_cooldown_buffer_ms=args.tts_cooldown_buffer_ms,
+                tts_trailing_silence_ms=args.tts_trailing_silence_ms,
             )
         )
 
