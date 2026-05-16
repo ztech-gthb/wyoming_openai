@@ -1513,3 +1513,21 @@ async def test_trailing_silence_sent_before_audio_stop(dummy_info, dummy_clients
     chunk = AudioChunk.from_event(chunk_event)
     assert len(chunk.audio) == 200 * 24000 // 1000 * 2 * 1
     assert chunk.audio == b"\x00" * 9600
+
+
+@pytest.mark.asyncio
+async def test_abort_synthesis_stamps_last_tts_end(handler_with_cooldown):
+    import time
+
+    handler_with_cooldown.write_event = AsyncMock()
+    handler_with_cooldown._audio_started = True
+
+    before = time.monotonic()
+    await handler_with_cooldown._abort_synthesis()
+    after = time.monotonic()
+
+    assert before <= handler_with_cooldown._last_tts_end <= after
+
+    event_types = [call.args[0].type for call in handler_with_cooldown.write_event.call_args_list]
+    assert "audio-stop" in event_types
+    assert "synthesize-stopped" in event_types

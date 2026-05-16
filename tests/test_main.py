@@ -376,3 +376,58 @@ async def test_main_allows_unused_stt_response_format_in_tts_only_mode(monkeypat
     )
 
     await main()
+
+
+@pytest.mark.asyncio
+async def test_main_rejects_negative_tts_trailing_silence_ms(monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv", ["wyoming_openai", "--tts-trailing-silence-ms", "-1"])
+
+    with pytest.raises(SystemExit) as exc_info:
+        await main()
+
+    assert exc_info.value.code == 2
+    assert "--tts-trailing-silence-ms must be non-negative" in capsys.readouterr().err
+
+
+@pytest.mark.asyncio
+async def test_main_rejects_tts_trailing_silence_ms_above_max(monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv", ["wyoming_openai", "--tts-trailing-silence-ms", "30001"])
+
+    with pytest.raises(SystemExit) as exc_info:
+        await main()
+
+    assert exc_info.value.code == 2
+    assert "--tts-trailing-silence-ms must be <= 30000" in capsys.readouterr().err
+
+
+@pytest.mark.asyncio
+async def test_main_rejects_zero_tts_cooldown_buffer_ms(monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv", ["wyoming_openai", "--tts-cooldown-buffer-ms", "0"])
+
+    with pytest.raises(SystemExit) as exc_info:
+        await main()
+
+    assert exc_info.value.code == 2
+    assert "--tts-cooldown-buffer-ms must be a positive integer" in capsys.readouterr().err
+
+
+@pytest.mark.asyncio
+async def test_main_rejects_negative_tts_cooldown_buffer_ms(monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv", ["wyoming_openai", "--tts-cooldown-buffer-ms", "-500"])
+
+    with pytest.raises(SystemExit) as exc_info:
+        await main()
+
+    assert exc_info.value.code == 2
+    assert "--tts-cooldown-buffer-ms must be a positive integer" in capsys.readouterr().err
+
+
+@pytest.mark.asyncio
+async def test_main_rejects_tts_cooldown_buffer_ms_above_max(monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv", ["wyoming_openai", "--tts-cooldown-buffer-ms", "60001"])
+
+    with pytest.raises(SystemExit) as exc_info:
+        await main()
+
+    assert exc_info.value.code == 2
+    assert "--tts-cooldown-buffer-ms must be <= 60000" in capsys.readouterr().err

@@ -629,7 +629,7 @@ class OpenAIEventHandler(AsyncEventHandler):
     async def _abort_synthesis(self) -> bool:
         """Abort the current synthesis session, emitting stop events and resetting state."""
         if self._audio_started:
-            await self.write_event(AudioStop(timestamp=int(self._current_timestamp)).event())
+            await self._finalize_tts(self._current_timestamp)
 
         await self.write_event(SynthesizeStopped().event())
 

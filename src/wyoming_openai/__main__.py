@@ -221,6 +221,18 @@ async def main():
 
     args = parser.parse_args()
 
+    max_trailing_silence_ms = 30_000
+    max_cooldown_buffer_ms = 60_000
+
+    if args.tts_trailing_silence_ms is not None and args.tts_trailing_silence_ms < 0:
+        parser.error("--tts-trailing-silence-ms must be non-negative")
+    if args.tts_trailing_silence_ms is not None and args.tts_trailing_silence_ms > max_trailing_silence_ms:
+        parser.error(f"--tts-trailing-silence-ms must be <= {max_trailing_silence_ms}")
+    if args.tts_cooldown_buffer_ms is not None and args.tts_cooldown_buffer_ms <= 0:
+        parser.error("--tts-cooldown-buffer-ms must be a positive integer")
+    if args.tts_cooldown_buffer_ms is not None and args.tts_cooldown_buffer_ms > max_cooldown_buffer_ms:
+        parser.error(f"--tts-cooldown-buffer-ms must be <= {max_cooldown_buffer_ms}")
+
     stt_requested = bool(args.stt_models or args.stt_streaming_models)
     tts_requested = bool(args.tts_models or args.tts_streaming_models)
     tts_validation_deferred = tts_requested and not args.tts_voices
