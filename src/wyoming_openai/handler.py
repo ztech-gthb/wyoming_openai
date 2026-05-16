@@ -128,6 +128,7 @@ class OpenAIEventHandler(AsyncEventHandler):
         self._tts_cooldown_buffer_ms = tts_cooldown_buffer_ms
         self._tts_trailing_silence_ms = tts_trailing_silence_ms
         self._last_tts_end: float = 0.0
+        self._last_tts_duration_ms: float = 0.0
 
         # State for current transcription
         self._wav_buffer: NamedBytesIO | None = None
@@ -252,27 +253,30 @@ class OpenAIEventHandler(AsyncEventHandler):
 
         self._is_recording = False
 
-        # Reject STT if TTS cooldown is active (prevents echo loop in continue_conversation)
-        if (
-            self._tts_cooldown_buffer_ms
-            and (time.monotonic() - self._last_tts_end) < self._tts_cooldown_buffer_ms / 1000.0
-        ):
+        # Reject STT if TTS cooldown is active (prevents echo loop in continue_conversation).
+        # Total cooldown = calculated TTS audio duration + configured buffer, measured from stream_end.
+        # This accounts for fast networks where all audio bytes are transmitted well before playback finishes.
+        if self._tts_cooldown_buffer_ms:
+            total_cooldown_ms = self._last_tts_duration_ms + self._tts_cooldown_buffer_ms
             elapsed_ms = (time.monotonic() - self._last_tts_end) * 1000
-            _LOGGER.info(
-                "STT suppressed: within TTS cooldown (%.0f ms elapsed, %.0f ms required)",
-                elapsed_ms,
-                self._tts_cooldown_buffer_ms,
-            )
-            if self._wav_write_buffer:
-                self._wav_write_buffer.close()
-                self._wav_write_buffer = None
-            if self._wav_buffer:
-                self._wav_buffer.close()
-                self._wav_buffer = None
-            await self.write_event(TranscriptStart().event())
-            await self.write_event(Transcript(text="").event())
-            await self.write_event(TranscriptStop().event())
-            return
+            if elapsed_ms < total_cooldown_ms:
+                _LOGGER.info(
+                    "STT suppressed: within TTS cooldown (%.0f ms elapsed, %.0f ms required: %.0f audio + %.0f buffer)",
+                    elapsed_ms,
+                    total_cooldown_ms,
+                    self._last_tts_duration_ms,
+                    self._tts_cooldown_buffer_ms,
+                )
+                if self._wav_write_buffer:
+                    self._wav_write_buffer.close()
+                    self._wav_write_buffer = None
+                if self._wav_buffer:
+                    self._wav_buffer.close()
+                    self._wav_buffer = None
+                await self.write_event(TranscriptStart().event())
+                await self.write_event(Transcript(text="").event())
+                await self.write_event(TranscriptStop().event())
+                return
 
         try:
             # Close the WAV file
@@ -662,6 +666,7 @@ class OpenAIEventHandler(AsyncEventHandler):
             timestamp += self._tts_trailing_silence_ms
         await self.write_event(AudioStop(timestamp=int(timestamp)).event())
         if self._tts_cooldown_buffer_ms:
+            self._last_tts_duration_ms = timestamp
             self._last_tts_end = time.monotonic()
         return timestamp
 

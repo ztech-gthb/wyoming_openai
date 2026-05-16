@@ -1481,12 +1481,43 @@ async def test_finalize_tts_marks_end_timestamp(handler_with_cooldown):
 
     handler_with_cooldown.write_event = AsyncMock()
     before = time.monotonic()
-    await handler_with_cooldown._finalize_tts(0.0)
+    await handler_with_cooldown._finalize_tts(3000.0)
     after = time.monotonic()
     assert before <= handler_with_cooldown._last_tts_end <= after
+    assert handler_with_cooldown._last_tts_duration_ms == 3000.0
 
     event_types = [call.args[0].type for call in handler_with_cooldown.write_event.call_args_list]
     assert "audio-stop" in event_types
+
+
+@pytest.mark.asyncio
+async def test_stt_suppressed_by_audio_duration_plus_buffer(handler_with_cooldown):
+    """STT must be suppressed even when elapsed > buffer alone, because audio duration extends window."""
+    import time
+
+    handler_with_cooldown.write_event = AsyncMock()
+    # Simulate: 2 s of TTS audio was sent, 500 ms buffer configured
+    # Set _last_tts_end to 600 ms ago — old fixed-buffer logic would pass, new logic suppresses
+    handler_with_cooldown._last_tts_duration_ms = 2000.0
+    handler_with_cooldown._last_tts_end = time.monotonic() - 0.6  # 600 ms ago
+
+    handler_with_cooldown._current_asr_model = handler_with_cooldown._get_asr_model("m1")
+    await handler_with_cooldown.handle_event(
+        Event(type="audio-start", data={"rate": 16000, "width": 2, "channels": 1})
+    )
+    await handler_with_cooldown.handle_event(
+        Event(type="audio-chunk", data={"rate": 16000, "width": 2, "channels": 1}, payload=b"\x00\x01" * 50)
+    )
+    await handler_with_cooldown.handle_event(Event(type="audio-stop"))
+
+    transcript_events = [
+        call.args[0]
+        for call in handler_with_cooldown.write_event.call_args_list
+        if call.args[0].type == "transcript"
+    ]
+    assert len(transcript_events) == 1
+    assert Transcript.from_event(transcript_events[0]).text == ""
+    handler_with_cooldown._stt_client.audio.transcriptions.create.assert_not_called()
 
 
 @pytest.mark.asyncio
