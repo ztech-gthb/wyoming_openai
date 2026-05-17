@@ -279,7 +279,7 @@ class OpenAIEventHandler(AsyncEventHandler):
                     "STT suppressed: within TTS cooldown (%.0f ms elapsed, %.0f ms required: %.0f audio + %.0f buffer)",
                     elapsed_ms,
                     total_cooldown_ms,
-                    self._last_tts_duration_ms,
+                    self._tts_cooldown_state.last_tts_duration_ms,
                     self._tts_cooldown_buffer_ms,
                 )
                 if self._wav_write_buffer:
