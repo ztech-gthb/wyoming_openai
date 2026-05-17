@@ -17,7 +17,7 @@ from .compatibility import (
     tts_voice_to_string,
 )
 from .const import DEFAULT_OPENAI_BASE_URL, __version__
-from .handler import OpenAIEventHandler
+from .handler import OpenAIEventHandler, TtsCooldownState
 from .utilities import create_enum_parser, create_json_object_parser, validate_stt_extra_body, validate_tts_extra_body
 
 
@@ -26,7 +26,12 @@ def configure_logging(level):
     numeric_level = getattr(logging, level.upper(), None)
     if not isinstance(numeric_level, int):
         raise ValueError(f"Invalid log level: {level}")
-    logging.basicConfig(level=numeric_level, force=True)
+    logging.basicConfig(
+        level=numeric_level,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+        datefmt="%Y-%m-%dT%H:%M:%S%z",
+        force=True,
+    )
 
 
 async def main():
@@ -206,8 +211,32 @@ async def main():
         default=int(_v) if (_v := os.getenv("TTS_STREAMING_MAX_CHARS")) else None,
         help="Maximum characters per chunk for streaming TTS (optional)",
     )
+    parser.add_argument(
+        "--tts-cooldown-buffer-ms",
+        type=int,
+        default=int(_v) if (_v := os.getenv("TTS_COOLDOWN_BUFFER_MS")) else None,
+        help="Milliseconds to suppress STT after TTS ends (prevents echo loop, default disabled)",
+    )
+    parser.add_argument(
+        "--tts-trailing-silence-ms",
+        type=int,
+        default=int(_v) if (_v := os.getenv("TTS_TRAILING_SILENCE_MS")) else None,
+        help="Milliseconds of PCM silence appended before AudioStop to delay mic-open (default disabled)",
+    )
 
     args = parser.parse_args()
+
+    max_trailing_silence_ms = 30_000
+    max_cooldown_buffer_ms = 60_000
+
+    if args.tts_trailing_silence_ms is not None and args.tts_trailing_silence_ms < 0:
+        parser.error("--tts-trailing-silence-ms must be non-negative")
+    if args.tts_trailing_silence_ms is not None and args.tts_trailing_silence_ms > max_trailing_silence_ms:
+        parser.error(f"--tts-trailing-silence-ms must be <= {max_trailing_silence_ms}")
+    if args.tts_cooldown_buffer_ms is not None and args.tts_cooldown_buffer_ms <= 0:
+        parser.error("--tts-cooldown-buffer-ms must be a positive integer")
+    if args.tts_cooldown_buffer_ms is not None and args.tts_cooldown_buffer_ms > max_cooldown_buffer_ms:
+        parser.error(f"--tts-cooldown-buffer-ms must be <= {max_cooldown_buffer_ms}")
 
     stt_requested = bool(args.stt_models or args.stt_streaming_models)
     tts_requested = bool(args.tts_models or args.tts_streaming_models)
@@ -340,6 +369,9 @@ async def main():
         # Create Wyoming server
         server = AsyncServer.from_uri(args.uri)
 
+        # Shared across all handler instances so TTS-end time is visible to the next STT connection
+        tts_cooldown_state = TtsCooldownState()
+
         # Run Wyoming server
         _logger.info("Starting server at %s", args.uri)
         await server.run(
@@ -356,6 +388,9 @@ async def main():
                 tts_extra_body=args.tts_extra_body,
                 tts_streaming_min_words=args.tts_streaming_min_words,
                 tts_streaming_max_chars=args.tts_streaming_max_chars,
+                tts_cooldown_buffer_ms=args.tts_cooldown_buffer_ms,
+                tts_trailing_silence_ms=args.tts_trailing_silence_ms,
+                tts_cooldown_state=tts_cooldown_state,
             )
         )
 

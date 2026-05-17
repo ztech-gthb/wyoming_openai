@@ -1361,3 +1361,204 @@ class TestOpenAIEventHandlerComprehensive:
         voice = enhanced_handler._get_voice("alloy")
         assert enhanced_handler._validate_tts_language("en", voice) is True
         assert enhanced_handler._validate_tts_language("fr", voice) is False
+
+
+@pytest.fixture
+def handler_with_cooldown(dummy_info, dummy_clients, dummy_reader_writer):
+    stt_client, tts_client = dummy_clients
+    reader, writer = dummy_reader_writer
+    return OpenAIEventHandler(
+        reader,
+        writer,
+        info=dummy_info,
+        stt_client=stt_client,
+        tts_client=tts_client,
+        tts_cooldown_buffer_ms=500,
+    )
+
+
+@pytest.mark.asyncio
+async def test_stt_suppressed_during_tts_cooldown(handler_with_cooldown):
+    import time
+
+    handler_with_cooldown.write_event = AsyncMock()
+    handler_with_cooldown._tts_cooldown_state.last_tts_end = time.monotonic()
+
+    handler_with_cooldown._current_asr_model = handler_with_cooldown._get_asr_model("m1")
+    await handler_with_cooldown.handle_event(
+        Event(type="audio-start", data={"rate": 16000, "width": 2, "channels": 1})
+    )
+    await handler_with_cooldown.handle_event(
+        Event(type="audio-chunk", data={"rate": 16000, "width": 2, "channels": 1}, payload=b"\x00\x01" * 50)
+    )
+    await handler_with_cooldown.handle_event(Event(type="audio-stop"))
+
+    event_types = [call.args[0].type for call in handler_with_cooldown.write_event.call_args_list]
+    assert "transcript-start" in event_types
+    assert "transcript" in event_types
+    assert "transcript-stop" in event_types
+
+    transcript_events = [
+        call.args[0]
+        for call in handler_with_cooldown.write_event.call_args_list
+        if call.args[0].type == "transcript"
+    ]
+    assert len(transcript_events) == 1
+    assert Transcript.from_event(transcript_events[0]).text == ""
+    handler_with_cooldown._stt_client.audio.transcriptions.create.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_stt_proceeds_after_cooldown_expires(handler_with_cooldown):
+    import time
+
+    handler_with_cooldown.write_event = AsyncMock()
+    handler_with_cooldown._tts_cooldown_state.last_tts_end = time.monotonic() - 1.0
+
+    mock_transcription = Mock()
+    mock_transcription.text = "hello world"
+    handler_with_cooldown._stt_client.audio.transcriptions.create = AsyncMock(return_value=mock_transcription)
+
+    handler_with_cooldown._current_asr_model = handler_with_cooldown._get_asr_model("m1")
+
+    with patch("wyoming_openai.handler.isinstance") as mock_isinstance:
+
+        def isinstance_side_effect(obj, class_or_tuple):
+            if obj is mock_transcription:
+                from openai.types.audio.transcription_create_response import TranscriptionCreateResponse
+
+                return class_or_tuple is TranscriptionCreateResponse
+            return builtins.isinstance(obj, class_or_tuple)
+
+        mock_isinstance.side_effect = isinstance_side_effect
+
+        await handler_with_cooldown.handle_event(
+            Event(type="audio-start", data={"rate": 16000, "width": 2, "channels": 1})
+        )
+        await handler_with_cooldown.handle_event(
+            Event(type="audio-chunk", data={"rate": 16000, "width": 2, "channels": 1}, payload=b"\x00\x01" * 50)
+        )
+        await handler_with_cooldown.handle_event(Event(type="audio-stop"))
+
+    handler_with_cooldown._stt_client.audio.transcriptions.create.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_stt_not_suppressed_when_cooldown_disabled(handler):
+    import time
+
+    handler.write_event = AsyncMock()
+    handler._last_tts_end = time.monotonic()
+
+    mock_transcription = Mock()
+    mock_transcription.text = "hello"
+    handler._stt_client.audio.transcriptions.create = AsyncMock(return_value=mock_transcription)
+    handler._current_asr_model = handler._get_asr_model("m1")
+
+    with patch("wyoming_openai.handler.isinstance") as mock_isinstance:
+
+        def isinstance_side_effect(obj, class_or_tuple):
+            if obj is mock_transcription:
+                from openai.types.audio.transcription_create_response import TranscriptionCreateResponse
+
+                return class_or_tuple is TranscriptionCreateResponse
+            return builtins.isinstance(obj, class_or_tuple)
+
+        mock_isinstance.side_effect = isinstance_side_effect
+
+        await handler.handle_event(Event(type="audio-start", data={"rate": 16000, "width": 2, "channels": 1}))
+        await handler.handle_event(
+            Event(type="audio-chunk", data={"rate": 16000, "width": 2, "channels": 1}, payload=b"\x00\x01" * 50)
+        )
+        await handler.handle_event(Event(type="audio-stop"))
+
+    handler._stt_client.audio.transcriptions.create.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_finalize_tts_marks_end_timestamp(handler_with_cooldown):
+    import time
+
+    handler_with_cooldown.write_event = AsyncMock()
+    before = time.monotonic()
+    await handler_with_cooldown._finalize_tts(3000.0)
+    after = time.monotonic()
+    assert before <= handler_with_cooldown._tts_cooldown_state.last_tts_end <= after
+    assert handler_with_cooldown._tts_cooldown_state.last_tts_duration_ms == 3000.0
+
+    event_types = [call.args[0].type for call in handler_with_cooldown.write_event.call_args_list]
+    assert "audio-stop" in event_types
+
+
+@pytest.mark.asyncio
+async def test_stt_suppressed_by_audio_duration_plus_buffer(handler_with_cooldown):
+    """STT must be suppressed even when elapsed > buffer alone, because audio duration extends window."""
+    import time
+
+    handler_with_cooldown.write_event = AsyncMock()
+    # Simulate: 2 s of TTS audio was sent, 500 ms buffer configured
+    # Set _last_tts_end to 600 ms ago — old fixed-buffer logic would pass, new logic suppresses
+    handler_with_cooldown._tts_cooldown_state.last_tts_duration_ms = 2000.0
+    handler_with_cooldown._tts_cooldown_state.last_tts_end = time.monotonic() - 0.6  # 600 ms ago
+
+    handler_with_cooldown._current_asr_model = handler_with_cooldown._get_asr_model("m1")
+    await handler_with_cooldown.handle_event(
+        Event(type="audio-start", data={"rate": 16000, "width": 2, "channels": 1})
+    )
+    await handler_with_cooldown.handle_event(
+        Event(type="audio-chunk", data={"rate": 16000, "width": 2, "channels": 1}, payload=b"\x00\x01" * 50)
+    )
+    await handler_with_cooldown.handle_event(Event(type="audio-stop"))
+
+    transcript_events = [
+        call.args[0]
+        for call in handler_with_cooldown.write_event.call_args_list
+        if call.args[0].type == "transcript"
+    ]
+    assert len(transcript_events) == 1
+    assert Transcript.from_event(transcript_events[0]).text == ""
+    handler_with_cooldown._stt_client.audio.transcriptions.create.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_trailing_silence_sent_before_audio_stop(dummy_info, dummy_clients, dummy_reader_writer):
+    from wyoming.audio import AudioChunk
+
+    stt_client, tts_client = dummy_clients
+    reader, writer = dummy_reader_writer
+    h = OpenAIEventHandler(
+        reader,
+        writer,
+        info=dummy_info,
+        stt_client=stt_client,
+        tts_client=tts_client,
+        tts_trailing_silence_ms=200,
+    )
+    h.write_event = AsyncMock()
+    await h._finalize_tts(0.0)
+
+    event_types = [call.args[0].type for call in h.write_event.call_args_list]
+    assert event_types == ["audio-chunk", "audio-stop"]
+
+    chunk_event = h.write_event.call_args_list[0].args[0]
+    chunk = AudioChunk.from_event(chunk_event)
+    assert len(chunk.audio) == 200 * 24000 // 1000 * 2 * 1
+    assert chunk.audio == b"\x00" * 9600
+
+
+@pytest.mark.asyncio
+async def test_abort_synthesis_stamps_last_tts_end(handler_with_cooldown):
+    import time
+
+    handler_with_cooldown.write_event = AsyncMock()
+    handler_with_cooldown._audio_started = True
+
+    before = time.monotonic()
+    await handler_with_cooldown._abort_synthesis()
+    after = time.monotonic()
+
+    assert before <= handler_with_cooldown._tts_cooldown_state.last_tts_end <= after
+
+    event_types = [call.args[0].type for call in handler_with_cooldown.write_event.call_args_list]
+    assert "audio-stop" in event_types
+    assert "synthesize-stopped" in event_types

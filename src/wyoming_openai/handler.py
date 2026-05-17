@@ -1,6 +1,7 @@
 import asyncio
 import io
 import logging
+import time
 import wave
 from dataclasses import dataclass
 from typing import cast
@@ -66,6 +67,14 @@ class TtsStreamError(Exception):
         self.voice = voice
 
 
+@dataclass
+class TtsCooldownState:
+    """Shared across all handler instances so TTS-end time survives connection boundaries."""
+
+    last_tts_end: float = 0.0
+    last_tts_duration_ms: float = 0.0
+
+
 class OpenAIEventHandler(AsyncEventHandler):
     def __init__(
         self,
@@ -81,6 +90,9 @@ class OpenAIEventHandler(AsyncEventHandler):
         tts_extra_body: dict[str, object] | None = None,
         tts_streaming_min_words: int | None = None,
         tts_streaming_max_chars: int | None = None,
+        tts_cooldown_buffer_ms: int | None = None,
+        tts_trailing_silence_ms: int | None = None,
+        tts_cooldown_state: "TtsCooldownState | None" = None,
         **kwargs,
     ) -> None:
         """
@@ -99,6 +111,8 @@ class OpenAIEventHandler(AsyncEventHandler):
             tts_extra_body (dict[str, object] | None): Optional JSON body fields merged into TTS requests.
             tts_streaming_min_words (int | None): Minimum words per chunk for streaming TTS.
             tts_streaming_max_chars (int | None): Maximum characters per chunk for streaming TTS.
+            tts_cooldown_buffer_ms (int | None): Milliseconds to suppress STT after TTS ends.
+            tts_trailing_silence_ms (int | None): Milliseconds of PCM silence appended before AudioStop.
             Note: The caller owns the STT/TTS clients and is responsible for closing them.
             **kwargs: Arbitrary keyword arguments for the superclass.
         """
@@ -120,6 +134,9 @@ class OpenAIEventHandler(AsyncEventHandler):
             validate_tts_extra_body(self._tts_extra_body)
         self._tts_streaming_min_words = tts_streaming_min_words
         self._tts_streaming_max_chars = tts_streaming_max_chars
+        self._tts_cooldown_buffer_ms = tts_cooldown_buffer_ms
+        self._tts_trailing_silence_ms = tts_trailing_silence_ms
+        self._tts_cooldown_state = tts_cooldown_state if tts_cooldown_state is not None else TtsCooldownState()
 
         # State for current transcription
         self._wav_buffer: NamedBytesIO | None = None
@@ -243,6 +260,48 @@ class OpenAIEventHandler(AsyncEventHandler):
             return
 
         self._is_recording = False
+
+        # Reject STT if TTS cooldown is active (prevents echo loop in continue_conversation).
+        # Total cooldown = calculated TTS audio duration + configured buffer, measured from stream_end.
+        # This accounts for fast networks where all audio bytes are transmitted well before playback finishes.
+        if self._tts_cooldown_buffer_ms:
+            total_cooldown_ms = self._tts_cooldown_state.last_tts_duration_ms + self._tts_cooldown_buffer_ms
+            elapsed_ms = (time.monotonic() - self._tts_cooldown_state.last_tts_end) * 1000
+            if elapsed_ms < total_cooldown_ms:
+                _LOGGER.debug(
+                    "STT holddown: ACTIVE — trigger yes, suppressing STT (%.0f ms elapsed < %.0f ms required: %.0f audio + %d buffer)",
+                    elapsed_ms,
+                    total_cooldown_ms,
+                    self._tts_cooldown_state.last_tts_duration_ms,
+                    self._tts_cooldown_buffer_ms,
+                )
+                _LOGGER.info(
+                    "STT suppressed: within TTS cooldown (%.0f ms elapsed, %.0f ms required: %.0f audio + %.0f buffer)",
+                    elapsed_ms,
+                    total_cooldown_ms,
+                    self._tts_cooldown_state.last_tts_duration_ms,
+                    self._tts_cooldown_buffer_ms,
+                )
+                if self._wav_write_buffer:
+                    self._wav_write_buffer.close()
+                    self._wav_write_buffer = None
+                if self._wav_buffer:
+                    self._wav_buffer.close()
+                    self._wav_buffer = None
+                await self.write_event(TranscriptStart().event())
+                await self.write_event(Transcript(text="").event())
+                await self.write_event(TranscriptStop().event())
+                return
+            else:
+                _LOGGER.debug(
+                    "STT holddown: inactive — trigger no, STT proceeding (%.0f ms elapsed >= %.0f ms required: %.0f audio + %d buffer)",
+                    elapsed_ms,
+                    total_cooldown_ms,
+                    self._tts_cooldown_state.last_tts_duration_ms,
+                    self._tts_cooldown_buffer_ms,
+                )
+        else:
+            _LOGGER.debug("STT holddown: disabled (TTS_COOLDOWN_BUFFER_MS not set)")
 
         try:
             # Close the WAV file
@@ -599,7 +658,7 @@ class OpenAIEventHandler(AsyncEventHandler):
     async def _abort_synthesis(self) -> bool:
         """Abort the current synthesis session, emitting stop events and resetting state."""
         if self._audio_started:
-            await self.write_event(AudioStop(timestamp=int(self._current_timestamp)).event())
+            await self._finalize_tts(self._current_timestamp)
 
         await self.write_event(SynthesizeStopped().event())
 
@@ -614,6 +673,33 @@ class OpenAIEventHandler(AsyncEventHandler):
         self._synthesis_voice = None
 
         return False
+
+    async def _finalize_tts(self, timestamp: float) -> float:
+        """Send optional trailing silence then AudioStop; record TTS-end time for STT cooldown."""
+        if self._tts_trailing_silence_ms:
+            silence_samples = int(self._tts_trailing_silence_ms * TTS_AUDIO_RATE / 1000)
+            silence_bytes = bytes(silence_samples * DEFAULT_AUDIO_WIDTH * DEFAULT_AUDIO_CHANNELS)
+            await self.write_event(
+                AudioChunk(
+                    audio=silence_bytes,
+                    rate=TTS_AUDIO_RATE,
+                    width=DEFAULT_AUDIO_WIDTH,
+                    channels=DEFAULT_AUDIO_CHANNELS,
+                    timestamp=int(timestamp),
+                ).event()
+            )
+            timestamp += self._tts_trailing_silence_ms
+        await self.write_event(AudioStop(timestamp=int(timestamp)).event())
+        if self._tts_cooldown_buffer_ms:
+            self._tts_cooldown_state.last_tts_duration_ms = timestamp
+            self._tts_cooldown_state.last_tts_end = time.monotonic()
+            _LOGGER.info(
+                "TTS cooldown armed: %.0f ms audio duration, %d ms buffer (total %.0f ms suppression)",
+                timestamp,
+                self._tts_cooldown_buffer_ms,
+                timestamp + self._tts_cooldown_buffer_ms,
+            )
+        return timestamp
 
     def _log_unsupported_asr_model(self, model_name: str | None = None):
         """Log an unsupported ASR model"""
@@ -763,7 +849,7 @@ class OpenAIEventHandler(AsyncEventHandler):
 
             if final_timestamp is not None:
                 # Send audio stop after streaming completes
-                await self.write_event(AudioStop(timestamp=int(final_timestamp)).event())
+                await self._finalize_tts(final_timestamp)
                 _LOGGER.info("Successfully synthesized: %s", _truncate_for_log(synthesize.text))
                 return True
             return False
@@ -884,7 +970,7 @@ class OpenAIEventHandler(AsyncEventHandler):
 
         # Send audio stop if we processed any audio incrementally
         if self._audio_started:
-            await self.write_event(AudioStop(timestamp=int(self._current_timestamp)).event())
+            await self._finalize_tts(self._current_timestamp)
             await self.write_event(SynthesizeStopped().event())
             _LOGGER.info(
                 "Successfully completed incremental streaming synthesis, final timestamp: %.2f", self._current_timestamp
@@ -996,7 +1082,7 @@ class OpenAIEventHandler(AsyncEventHandler):
                     total_timestamp = chunk_timestamp
 
                 # Send final audio stop
-                await self.write_event(AudioStop(timestamp=int(total_timestamp)).event())
+                await self._finalize_tts(total_timestamp)
                 _LOGGER.info("Successfully completed concurrent streaming synthesis: %s", _truncate_for_log(full_text))
             else:
                 # Use non-streaming synthesis for non-streaming voices
@@ -1152,7 +1238,7 @@ class OpenAIEventHandler(AsyncEventHandler):
 
         if final_timestamp is not None:
             # Send audio stop after streaming completes
-            await self.write_event(AudioStop(timestamp=int(final_timestamp)).event())
+            await self._finalize_tts(final_timestamp)
             _LOGGER.info("Successfully synthesized non-streaming: %s", _truncate_for_log(text))
             return True
         return False
