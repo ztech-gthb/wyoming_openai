@@ -17,7 +17,7 @@ from .compatibility import (
     tts_voice_to_string,
 )
 from .const import DEFAULT_OPENAI_BASE_URL, __version__
-from .handler import OpenAIEventHandler
+from .handler import OpenAIEventHandler, TtsCooldownState
 from .utilities import create_enum_parser, create_json_object_parser, validate_stt_extra_body, validate_tts_extra_body
 
 
@@ -364,6 +364,9 @@ async def main():
         # Create Wyoming server
         server = AsyncServer.from_uri(args.uri)
 
+        # Shared across all handler instances so TTS-end time is visible to the next STT connection
+        tts_cooldown_state = TtsCooldownState()
+
         # Run Wyoming server
         _logger.info("Starting server at %s", args.uri)
         await server.run(
@@ -382,6 +385,7 @@ async def main():
                 tts_streaming_max_chars=args.tts_streaming_max_chars,
                 tts_cooldown_buffer_ms=args.tts_cooldown_buffer_ms,
                 tts_trailing_silence_ms=args.tts_trailing_silence_ms,
+                tts_cooldown_state=tts_cooldown_state,
             )
         )
 

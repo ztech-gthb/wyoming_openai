@@ -67,6 +67,14 @@ class TtsStreamError(Exception):
         self.voice = voice
 
 
+@dataclass
+class TtsCooldownState:
+    """Shared across all handler instances so TTS-end time survives connection boundaries."""
+
+    last_tts_end: float = 0.0
+    last_tts_duration_ms: float = 0.0
+
+
 class OpenAIEventHandler(AsyncEventHandler):
     def __init__(
         self,
@@ -84,6 +92,7 @@ class OpenAIEventHandler(AsyncEventHandler):
         tts_streaming_max_chars: int | None = None,
         tts_cooldown_buffer_ms: int | None = None,
         tts_trailing_silence_ms: int | None = None,
+        tts_cooldown_state: "TtsCooldownState | None" = None,
         **kwargs,
     ) -> None:
         """
@@ -127,8 +136,7 @@ class OpenAIEventHandler(AsyncEventHandler):
         self._tts_streaming_max_chars = tts_streaming_max_chars
         self._tts_cooldown_buffer_ms = tts_cooldown_buffer_ms
         self._tts_trailing_silence_ms = tts_trailing_silence_ms
-        self._last_tts_end: float = 0.0
-        self._last_tts_duration_ms: float = 0.0
+        self._tts_cooldown_state = tts_cooldown_state if tts_cooldown_state is not None else TtsCooldownState()
 
         # State for current transcription
         self._wav_buffer: NamedBytesIO | None = None
@@ -257,8 +265,15 @@ class OpenAIEventHandler(AsyncEventHandler):
         # Total cooldown = calculated TTS audio duration + configured buffer, measured from stream_end.
         # This accounts for fast networks where all audio bytes are transmitted well before playback finishes.
         if self._tts_cooldown_buffer_ms:
-            total_cooldown_ms = self._last_tts_duration_ms + self._tts_cooldown_buffer_ms
-            elapsed_ms = (time.monotonic() - self._last_tts_end) * 1000
+            total_cooldown_ms = self._tts_cooldown_state.last_tts_duration_ms + self._tts_cooldown_buffer_ms
+            elapsed_ms = (time.monotonic() - self._tts_cooldown_state.last_tts_end) * 1000
+            _LOGGER.debug(
+                "STT cooldown check: %.0f ms elapsed, %.0f ms required (%.0f audio + %d buffer)",
+                elapsed_ms,
+                total_cooldown_ms,
+                self._tts_cooldown_state.last_tts_duration_ms,
+                self._tts_cooldown_buffer_ms,
+            )
             if elapsed_ms < total_cooldown_ms:
                 _LOGGER.info(
                     "STT suppressed: within TTS cooldown (%.0f ms elapsed, %.0f ms required: %.0f audio + %.0f buffer)",
@@ -666,8 +681,14 @@ class OpenAIEventHandler(AsyncEventHandler):
             timestamp += self._tts_trailing_silence_ms
         await self.write_event(AudioStop(timestamp=int(timestamp)).event())
         if self._tts_cooldown_buffer_ms:
-            self._last_tts_duration_ms = timestamp
-            self._last_tts_end = time.monotonic()
+            self._tts_cooldown_state.last_tts_duration_ms = timestamp
+            self._tts_cooldown_state.last_tts_end = time.monotonic()
+            _LOGGER.info(
+                "TTS cooldown armed: %.0f ms audio duration, %d ms buffer (total %.0f ms suppression)",
+                timestamp,
+                self._tts_cooldown_buffer_ms,
+                timestamp + self._tts_cooldown_buffer_ms,
+            )
         return timestamp
 
     def _log_unsupported_asr_model(self, model_name: str | None = None):
