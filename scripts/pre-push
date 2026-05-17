@@ -1,11 +1,20 @@
 #!/usr/bin/env bash
 # Runs before git push. Blocks push on lint or type errors.
+# Skips gracefully if tools are not installed.
 set -e
 
-echo "→ ruff check"
-ruff check .
+if command -v ruff &>/dev/null; then
+    echo "→ ruff check"
+    ruff check .
+else
+    echo "⚠ ruff not found, skipping lint"
+fi
 
-echo "→ pyright"
-pyright
+if command -v pyright &>/dev/null; then
+    echo "→ pyright"
+    pyright
+else
+    echo "⚠ pyright not found, skipping type check"
+fi
 
-echo "✓ pre-push checks passed"
+echo "✓ pre-push checks done"
