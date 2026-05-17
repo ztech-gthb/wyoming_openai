@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Runs before git push. Blocks push on lint or type errors.
+set -e
+
+echo "→ ruff check"
+ruff check .
+
+echo "→ pyright"
+pyright
+
+echo "✓ pre-push checks passed"
