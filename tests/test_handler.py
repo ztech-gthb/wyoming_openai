@@ -1382,7 +1382,7 @@ async def test_stt_suppressed_during_tts_cooldown(handler_with_cooldown):
     import time
 
     handler_with_cooldown.write_event = AsyncMock()
-    handler_with_cooldown._last_tts_end = time.monotonic()
+    handler_with_cooldown._tts_cooldown_state.last_tts_end = time.monotonic()
 
     handler_with_cooldown._current_asr_model = handler_with_cooldown._get_asr_model("m1")
     await handler_with_cooldown.handle_event(
@@ -1413,7 +1413,7 @@ async def test_stt_proceeds_after_cooldown_expires(handler_with_cooldown):
     import time
 
     handler_with_cooldown.write_event = AsyncMock()
-    handler_with_cooldown._last_tts_end = time.monotonic() - 1.0
+    handler_with_cooldown._tts_cooldown_state.last_tts_end = time.monotonic() - 1.0
 
     mock_transcription = Mock()
     mock_transcription.text = "hello world"
@@ -1483,8 +1483,8 @@ async def test_finalize_tts_marks_end_timestamp(handler_with_cooldown):
     before = time.monotonic()
     await handler_with_cooldown._finalize_tts(3000.0)
     after = time.monotonic()
-    assert before <= handler_with_cooldown._last_tts_end <= after
-    assert handler_with_cooldown._last_tts_duration_ms == 3000.0
+    assert before <= handler_with_cooldown._tts_cooldown_state.last_tts_end <= after
+    assert handler_with_cooldown._tts_cooldown_state.last_tts_duration_ms == 3000.0
 
     event_types = [call.args[0].type for call in handler_with_cooldown.write_event.call_args_list]
     assert "audio-stop" in event_types
@@ -1498,8 +1498,8 @@ async def test_stt_suppressed_by_audio_duration_plus_buffer(handler_with_cooldow
     handler_with_cooldown.write_event = AsyncMock()
     # Simulate: 2 s of TTS audio was sent, 500 ms buffer configured
     # Set _last_tts_end to 600 ms ago — old fixed-buffer logic would pass, new logic suppresses
-    handler_with_cooldown._last_tts_duration_ms = 2000.0
-    handler_with_cooldown._last_tts_end = time.monotonic() - 0.6  # 600 ms ago
+    handler_with_cooldown._tts_cooldown_state.last_tts_duration_ms = 2000.0
+    handler_with_cooldown._tts_cooldown_state.last_tts_end = time.monotonic() - 0.6  # 600 ms ago
 
     handler_with_cooldown._current_asr_model = handler_with_cooldown._get_asr_model("m1")
     await handler_with_cooldown.handle_event(
@@ -1557,7 +1557,7 @@ async def test_abort_synthesis_stamps_last_tts_end(handler_with_cooldown):
     await handler_with_cooldown._abort_synthesis()
     after = time.monotonic()
 
-    assert before <= handler_with_cooldown._last_tts_end <= after
+    assert before <= handler_with_cooldown._tts_cooldown_state.last_tts_end <= after
 
     event_types = [call.args[0].type for call in handler_with_cooldown.write_event.call_args_list]
     assert "audio-stop" in event_types
