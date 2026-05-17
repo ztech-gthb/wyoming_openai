@@ -267,14 +267,14 @@ class OpenAIEventHandler(AsyncEventHandler):
         if self._tts_cooldown_buffer_ms:
             total_cooldown_ms = self._tts_cooldown_state.last_tts_duration_ms + self._tts_cooldown_buffer_ms
             elapsed_ms = (time.monotonic() - self._tts_cooldown_state.last_tts_end) * 1000
-            _LOGGER.debug(
-                "STT cooldown check: %.0f ms elapsed, %.0f ms required (%.0f audio + %d buffer)",
-                elapsed_ms,
-                total_cooldown_ms,
-                self._tts_cooldown_state.last_tts_duration_ms,
-                self._tts_cooldown_buffer_ms,
-            )
             if elapsed_ms < total_cooldown_ms:
+                _LOGGER.debug(
+                    "STT holddown: ACTIVE — trigger yes, suppressing STT (%.0f ms elapsed < %.0f ms required: %.0f audio + %d buffer)",
+                    elapsed_ms,
+                    total_cooldown_ms,
+                    self._tts_cooldown_state.last_tts_duration_ms,
+                    self._tts_cooldown_buffer_ms,
+                )
                 _LOGGER.info(
                     "STT suppressed: within TTS cooldown (%.0f ms elapsed, %.0f ms required: %.0f audio + %.0f buffer)",
                     elapsed_ms,
@@ -292,6 +292,16 @@ class OpenAIEventHandler(AsyncEventHandler):
                 await self.write_event(Transcript(text="").event())
                 await self.write_event(TranscriptStop().event())
                 return
+            else:
+                _LOGGER.debug(
+                    "STT holddown: inactive — trigger no, STT proceeding (%.0f ms elapsed >= %.0f ms required: %.0f audio + %d buffer)",
+                    elapsed_ms,
+                    total_cooldown_ms,
+                    self._tts_cooldown_state.last_tts_duration_ms,
+                    self._tts_cooldown_buffer_ms,
+                )
+        else:
+            _LOGGER.debug("STT holddown: disabled (TTS_COOLDOWN_BUFFER_MS not set)")
 
         try:
             # Close the WAV file
